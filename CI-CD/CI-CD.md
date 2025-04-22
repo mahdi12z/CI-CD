@@ -205,3 +205,327 @@ push:
     - docker compose -f docker-compose-production.yml push
 
 ```
+
+```bash
+version: "3.8"
+
+services:
+
+  aress_postgres:
+    image: postgres:16
+    shm_size: 1g
+    command: postgres -c 'max_connections=${POSTGRES__MAX_CONNECTIONS}' -c 'shared_buffers=256MB'
+    container_name: aress_postgres
+    restart: always
+    ports:
+      - "5432:5432"
+    logging:
+      options:
+        max-size: "50m"
+    environment:
+      POSTGRES_DB: ${POSTGRES__DB}
+      POSTGRES_USER: ${POSTGRES__USER}
+      POSTGRES_PASSWORD: ${POSTGRES__PASSWORD}
+      TZ: ${TIME_ZONE}
+      PGTZ: ${TIME_ZONE}
+    healthcheck:
+      test: [ "CMD-SHELL", "sh -c 'pg_isready -U ${POSTGRES__USER} -d ${POSTGRES__DB}'" ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - postgres_volume:/var/lib/aress_postgresql/data
+    networks:
+      - aress_net
+
+  aress_timescaledb:
+    image: timescale/timescaledb:2.16.1-pg16
+    container_name: aress_timescaledb
+    restart: always
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: ${TIMESCALEDB__DB}
+      POSTGRES_USER: ${TIMESCALEDB__USER}
+      POSTGRES_PASSWORD: ${TIMESCALEDB__PASSWORD}
+      TZ: ${TIME_ZONE}
+      PGTZ: ${TIME_ZONE}
+    healthcheck:
+      test: [ "CMD-SHELL", "sh -c 'pg_isready -U ${TIMESCALEDB__USER} -d ${TIMESCALEDB__DB}'" ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - timescaledb_volume:/var/lib/aress_timescaledb/data
+    networks:
+      - aress_net
+
+  aress_redis:
+    image: redis:7.4.0
+    container_name: aress_redis
+    logging:
+      options:
+        max-size: "50m"
+    deploy:
+      restart_policy:
+        condition: on-failure
+        max_attempts: 3
+    ports:
+      - "${REDIS__PORT}:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "--raw", "incr", "ping" ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - aress_net
+    volumes:
+      - redis_volume:/data
+    command: [ sh, -c, "rm -f /data/dump.rdb && redis-server --save '' --dbfilename '' --appendonly no --appendfsync no" ]
+
+  aress_pgadmin:
+    image: dpage/pgadmin4:8.11.0
+    container_name: aress_pgadmin
+    restart: always
+    ports:
+      - "${PGADMIN__PORT}:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN__DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN__DEFAULT_PASSWORD}
+    entrypoint: /bin/sh -c "chmod 600 /postgres_pgpass; chmod 600 /timescaledb_pgpass; /entrypoint.sh;"
+    user: root
+    configs:
+      - source: pgadmin4_servers.json
+        target: /pgadmin4/servers.json
+      - source: pgadmin4_postgres_pgpass
+        target: /postgres_pgpass
+      - source: pgadmin4_timescaledb_pgpass
+        target: /timescaledb_pgpass
+    volumes:
+      - pgadmin_volume:/var/lib/aress_pgadmin
+    networks:
+      - aress_net
+
+  aress_admin:
+    build: .
+    image: 192.168.100.94:32500/aressfdp/aress-admin:latest
+    container_name: aress_admin
+    pull_policy: missing
+    logging:
+      options:
+        max-size: "100m"
+    command: bash -c "python manage.py collectstatic --settings=AressFunds.settings --no-input && python manage.py migrate --settings=AressFunds.settings --database ${DJANGO__POSTGRES_ALIAS} && python manage.py migrate --settings=AressFunds.settings --database ${DJANGO__TIMESCALEDB_ALIAS} && gunicorn --workers=2 --threads=2 AressFunds.wsgi -b 0.0.0.0:8000 --timeout=1800 --max-requests 100 --max-requests-jitter 50"
+    environment:
+      PREFECT_SERVER_ANALYTICS_ENABLED: false
+      PREFECT_RESULTS_PERSIST_BY_DEFAULT: false
+    ports:
+      - "${DJANGO__ADMIN__PORT}:8000"
+    depends_on:
+      aress_postgres:
+        condition: service_healthy
+      aress_timescaledb:
+        condition: service_healthy
+      aress_redis:
+        condition: service_healthy
+    volumes:
+      - files_static:/src/static
+      - files_media:/src/media
+    networks:
+      - aress_net
+
+  aress_api:
+    build: .
+    image: 192.168.100.94:32500/aressfdp/aress-api:latest
+    container_name: aress_api
+    environment:
+      - DJANGO_SETTINGS_MODULE=AressFunds.settings
+    ports:
+      - "${API_PORT}:8000"
+    depends_on:
+      aress_postgres:
+        condition: service_healthy
+      aress_timescaledb:
+        condition: service_healthy
+      aress_redis:
+        condition: service_healthy
+    command: bash -c "uvicorn --workers 1 --host 0.0.0.0 --port 8000 api.aress_api:app"
+    volumes:
+      - files_static:/src/static
+      - files_media:/src/media
+    networks:
+      - aress_net
+
+  aress_prefect_server:
+    build: .
+    image: 192.168.100.94:32500/aressfdp/aress-prefect-server:latest
+    container_name: aress_prefect_server
+    restart: always
+    command: bash -c "prefect server start --port ${PREFECT__PORT}"
+    environment:
+      PREFECT_UI_URL: "http://${PREFECT__HOST}:${PREFECT__PORT}"
+      PREFECT_API_URL: "http://localhost:4200/api"
+      # If you want to access Prefect Server UI from anywhere other than the Docker host machine, you will need to change
+      # PREFECT_UI_URL and PREFECT_API_URL to match the external hostname/IP of the host machine. For example:
+      #- PREFECT_UI_URL=http://external-ip:4200/api
+      #- PREFECT_API_URL=http://external-ip:4200/api
+      PREFECT_SERVER_API_PORT: ${PREFECT__PORT}
+      PREFECT_SERVER_API_HOST: ${PREFECT__SERVER_API_HOST}
+      PREFECT_SERVER_ANALYTICS_ENABLED: false
+      PREFECT_RESULTS_PERSIST_BY_DEFAULT: false
+      PREFECT_UI_ENABLED: true
+      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://${POSTGRES__USER}:${POSTGRES__PASSWORD}@${POSTGRES__HOST}:5432/${POSTGRES__DB}
+      # Uncomment the following line if you want to use the 'S3 Bucket' storage block instead of the older 'S3' storage
+      # - EXTRA_PIP_PACKAGES=prefect-aws
+    ports:
+      - "${PREFECT__PORT}:4200"
+    healthcheck:
+      test: ["CMD", "curl", "--request", "POST", "-f", "http://${PREFECT__HOST}:${PREFECT__PORT}/api/flow_runs/count"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - prefect_volume:/root/.prefect
+    depends_on:
+      aress_postgres:
+        condition: service_healthy
+      aress_timescaledb:
+        condition: service_healthy
+    networks:
+      - aress_net
+
+  aress_prefect_worker_tsetmc:
+    build: .
+    image: 192.168.100.94:32500/aressfdp/aress-prefect-worker-tsetmc:latest
+    container_name: aress_prefect_worker_tsetmc
+    restart: always
+    command: bash -c "prefect worker start --pool tsetmc"
+    environment:
+      PREFECT_API_URL: "http://${PREFECT__HOST}:${PREFECT__PORT}/api"
+      PREFECT_RESULTS_PERSIST_BY_DEFAULT: false
+#       Use PREFECT_API_KEY if connecting the agent to Prefect Cloud
+#     - PREFECT_API_KEY=YOUR_API_KEY
+    depends_on:
+      aress_prefect_server:
+        condition: service_healthy
+    networks:
+      - aress_net
+
+  aress_prefect_worker_funds:
+    build: .
+    image: 192.168.100.94:32500/aressfdp/aress-prefect-worker-funds:latest
+    container_name: aress_prefect_worker_funds
+    restart: always
+    command: bash -c "prefect worker start --pool funds"
+    environment:
+      PREFECT_API_URL: "http://${PREFECT__HOST}:${PREFECT__PORT}/api"
+      PREFECT_RESULTS_PERSIST_BY_DEFAULT: false
+    depends_on:
+      aress_prefect_server:
+        condition: service_healthy
+    networks:
+      - aress_net
+
+  aress_prefect_worker_reports:
+    build: .
+    image: 192.168.100.94:32500/aressfdp/aress-prefect-worker-reports:latest
+    container_name: aress_prefect_worker_reports
+    restart: always
+    command: bash -c "prefect worker start --pool reports"
+    environment:
+      PREFECT_API_URL: "http://${PREFECT__HOST}:${PREFECT__PORT}/api"
+      PREFECT_RESULTS_PERSIST_BY_DEFAULT: false
+    depends_on:
+      aress_prefect_server:
+        condition: service_healthy
+    networks:
+      - aress_net
+
+  aress_prefect_worker_videos:
+    build: .
+    image: 192.168.100.94:32500/aressfdp/aress-prefect-worker-videos:latest
+    container_name: aress_prefect_worker_videos
+    restart: always
+    command: bash -c "prefect worker start --pool videos"
+    environment:
+      PREFECT_API_URL: "http://${PREFECT__HOST}:${PREFECT__PORT}/api"
+      PREFECT_RESULTS_PERSIST_BY_DEFAULT: false
+    depends_on:
+      aress_prefect_server:
+        condition: service_healthy
+    networks:
+      - aress_net
+
+  aress_prefect_deploy:
+    build: .
+    image: 192.168.100.94:32500/aressfdp/aress-prefect-deploy:latest
+    container_name: aress_prefect_deploy
+    restart: no
+    depends_on:
+      aress_prefect_worker_tsetmc:
+        condition: service_started
+      aress_prefect_worker_funds:
+        condition: service_started
+      aress_prefect_worker_videos:
+        condition: service_started
+      aress_prefect_worker_reports:
+        condition: service_started
+    environment:
+      PREFECT_API_URL: "http://${PREFECT__HOST}:${PREFECT__PORT}/api"
+    entrypoint: [ "bash", "-c", "prefect deploy --all"]
+    networks:
+      - aress_net
+
+
+
+
+configs:
+  pgadmin4_postgres_pgpass:
+    content: ${POSTGRES__HOST}:${POSTGRES__PORT}:${POSTGRES__DB}:${POSTGRES__USER}:${POSTGRES__PASSWORD}
+  pgadmin4_timescaledb_pgpass:
+    content: ${TIMESCALEDB__HOST}:${TIMESCALEDB__PORT}:${TIMESCALEDB__DB}:${TIMESCALEDB__USER}:${TIMESCALEDB__PASSWORD}
+  pgadmin4_servers.json:
+    content: |
+      {
+        "Servers": {
+          "1": {
+            "Group": "Servers",
+            "Name": "Postgres",
+            "Host": "${POSTGRES__HOST}",
+            "Port": ${POSTGRES__PORT},
+            "MaintenanceDB": "${POSTGRES__DB}",
+            "Username": "${POSTGRES__USER}",
+            "PassFile": "/postgres_pgpass",
+            "SSLMode": "prefer"
+          },
+          "2": {
+            "Group": "Servers",
+            "Name": "TimeScaleDB",
+            "Host": "${TIMESCALEDB__HOST}",
+            "Port": ${TIMESCALEDB__PORT},
+            "MaintenanceDB": "${TIMESCALEDB__DB}",
+            "Username": "${TIMESCALEDB__USER}",
+            "PassFile": "/timescaledb_pgpass",
+            "SSLMode": "prefer"
+          }
+        }
+      }
+
+
+volumes:
+  postgres_volume:
+  timescaledb_volume:
+  jupyter_volume:
+  redis_volume:
+  prefect_volume:
+  pgadmin_volume:
+  files_static:
+  files_media:
+  files_notebook:
+  zookeeper_data:
+  zookeeper_log:
+  kafka_broker_data:
+
+networks:
+  aress_net:
+    external: true
+```
