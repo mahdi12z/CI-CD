@@ -166,3 +166,42 @@ This CI/CD pipeline:
 - Uses Docker-in-Docker to make Docker available inside GitLab's containerized CI runner.
 
 ----
+
+-----
+----
+```bash
+stages:
+  - build
+  - push
+
+variables:
+  COMPOSE_PROJECT_NAME: aressfdp
+  IMAGE_TAG: latest
+  REGISTRY_URL: 192.168.100.94:32500
+  DOCKER_TLS_CERTDIR: ""
+
+build:
+  stage: build
+  image: docker:24.0.2
+  services:
+    - docker:24.0.2-dind
+  before_script:
+    - echo "Logging into Nexus Registry..."
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $REGISTRY_URL -u "$CI_REGISTRY_USER" --password-stdin
+  script:
+    - echo "Building all images via Docker Compose (production config)..."
+    - docker compose -f docker-compose-production.yml build
+
+push:
+  stage: push
+  image: docker:24.0.2
+  services:
+    - docker:24.0.2-dind
+  before_script:
+    - echo "Logging into Nexus for image push..."
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $REGISTRY_URL -u "$CI_REGISTRY_USER" --password-stdin
+  script:
+    - echo "Pushing all images to Nexus (production config)..."
+    - docker compose -f docker-compose-production.yml push
+
+```
